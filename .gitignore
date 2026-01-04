@@ -1,0 +1,74 @@
+# Python Virtual Environment
+bin/
+lib/
+lib64/
+include/
+share/
+etc/
+pyvenv.cfg
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Training Data and Models
+TinyStories-train.txt
+*.pt
+*.pth
+*.ckpt
+best_model.pt
+
+# TensorBoard Logs
+runs/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Matplotlib
+*.png
+*.jpg
+*.jpeg
+
+# Logs
+*.log
