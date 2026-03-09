@@ -15,10 +15,16 @@ __pycache__/
 
 # Training Data and Models
 TinyStories-train.txt
+train.txt
+val.txt
+*.bin
 *.pt
 *.pth
 *.ckpt
 best_model.pt
+
+# Profiling outputs
+*.ncu-rep
 
 # TensorBoard Logs
 runs/
