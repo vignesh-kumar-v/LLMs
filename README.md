@@ -1,142 +1,178 @@
-# NanoLLM - Tiny Language Model Trainer
+# NanoLLM — Tiny Language Model Trainer
 
-A lightweight GPT-2 style transformer model implementation trained on the TinyStories dataset. This project provides a minimalist approach to understanding and training transformer-based language models from scratch.
+A GPT-2 style transformer trained on the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset, built from scratch in PyTorch. The project goes beyond a basic implementation — it includes **custom fused CUDA kernels** for LayerNorm with three progressively optimised versions, an ncu profiling pipeline, and full GPU memory/utilisation tracking.
 
-## Overview
-
-This project implements a simplified version of GPT-2 with custom implementations of:
-- Multi-head self-attention mechanism
-- Token and positional embeddings
-- Custom dataset loader for efficient training
-- TensorBoard integration for training visualization
+---
 
 ## Project Structure
 
 ```
 LLMs/
-├── main.py                    # Main training script with data preprocessing and model training
-├── NanoLLM.py                 # GPT-2 model architecture with multi-head attention
-├── TinyStories.py             # Custom dataset class for loading and processing text data
-├── CrossEntropyLoss.py        # Custom cross-entropy loss implementation
-├── config.py                  # Training hyperparameters and model configuration
-├── TinyStories-train.txt      # Training dataset (not included in repo)
-└── best_model.pt              # Saved model checkpoint (not included in repo)
+├── NanoLLM.py              # Model architecture + FusedLayerNorm with kernel dispatch
+├── main.py                 # Training loop (get_batch memmap, grad clip, GPU monitoring)
+├── config.py               # All hyperparameters
+├── dataset.py              # TinyStoriesDataset (sliding window)
+├── CrossEntropyLoss.py     # Custom cross-entropy loss
+├── TinyStories.py          # Dataset downloader from HuggingFace
+│
+├── fused_layernorm.cu      # CUDA kernels: V1 (naive) + V2 (Welford + warp shuffle)
+├── fused_layernorm_v3.cu   # CUDA kernel:  V3 (float4 + two-level warp shuffle + multi-row blocks)
+├── test_layernorm.py       # Correctness checks + benchmark (V1 vs V2 vs V3 vs PyTorch)
+├── profile_run.py          # Minimal ncu profiling script (torch.compile disabled)
+│
+└── requirements.txt
 ```
 
-## Features
-
-- **Custom Transformer Architecture**: Implements multi-head attention with weight normalization
-- **Efficient Training**: Uses strided windowing for dataset creation
-- **Training Monitoring**: TensorBoard integration for visualizing loss, gradients, and weights
-- **Model Checkpointing**: Automatically saves best performing model
-- **Text Generation**: Includes inference capability with temperature-based sampling
-- **GPU Acceleration**: CUDA support with torch.compile optimization
+---
 
 ## Model Architecture
 
-- **Attention Mechanism**: Multi-head self-attention with 4 heads
-- **Context Length**: 128 tokens
-- **Embedding Dimension**: 128
-- **Vocabulary**: GPT-2 BPE tokenizer (50,257 tokens)
-- **Dropout**: 0.3 for attention layers
-- **Activation**: ReLU activation functions
+| Component | Detail |
+|---|---|
+| Type | GPT-2 style decoder-only transformer |
+| Vocabulary | GPT-2 BPE via tiktoken (50,257 tokens) |
+| Context length | 128 tokens |
+| Embedding dim | 128 |
+| Attention heads | 4 |
+| Transformer blocks | 4 |
+| Activation | GELU |
+| Dropout | 0.1 |
+| LayerNorm | Custom fused CUDA kernel (see below) |
 
-## Requirements
+---
 
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA-capable GPU (recommended)
-- See `requirements.txt` for full dependencies
+## Custom CUDA LayerNorm Kernels
 
-## Installation
+Three kernels are implemented in `fused_layernorm.cu` and `fused_layernorm_v3.cu`, with automatic dispatch inside `FusedLayerNorm`:
 
-1. Clone the repository:
-```bash
-git clone <your-repo-url>
-cd LLMs
-```
+| Version | Technique | Best at |
+|---|---|---|
+| **V1** | Shared-memory tree reduction (2 passes: mean then variance) | baseline |
+| **V2** | Welford online algorithm + `__shfl_down_sync` warp shuffle | N ≤ 256 |
+| **V3** | float4 vectorised loads + two-level warp shuffle + multi-row blocks | N > 256 |
 
-2. Create a virtual environment:
+**Benchmark results (B=512):**
+
+| Kernel | N=128 | N=768 |
+|---|---|---|
+| V1 Naive | 8.38 µs | 49.15 µs |
+| V2 Welford | 8.37 µs | 67.64 µs |
+| V3 float4 | 16.42 µs | **18.46 µs** |
+| PyTorch LN | 14.33 µs | 14.15 µs |
+
+`FusedLayerNorm` dispatches automatically:
+- `float32`, `N ≤ 256` → **V2** (~1.7× faster than PyTorch at N=128)
+- `float32`, `N > 256` → **V3** (2.66× faster than V1 at N=768)
+- `bfloat16` / CPU → `F.layer_norm` fallback
+
+---
+
+## Training
+
+### 1. Install dependencies
 ```bash
 python -m venv .
-source bin/activate  # On Windows: Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+source bin/activate
 pip install -r requirements.txt
+sudo apt install ninja-build   # required for JIT-compiling CUDA extensions
 ```
 
-4. Download the TinyStories dataset:
+### 2. Download the dataset
 ```bash
-# Place your TinyStories-train.txt in the project root
+python TinyStories.py   # saves train.txt and val.txt
 ```
 
-## Usage
-
-### Training
-
-Run the training script:
+### 3. Run training
 ```bash
 python main.py
 ```
 
-Training parameters can be configured in `config.py`:
-- `context_length`: Maximum sequence length (default: 128)
-- `batch_size`: Training batch size (default: 8)
-- `num_epochs`: Number of training epochs (default: 50)
-- `learning_rate`: AdamW learning rate (default: 3e-4)
-- `num_embeddings`: Embedding dimension (default: 128)
-- `stride`: Dataset stride for overlapping windows (default: 32)
+On first run, `train.txt` and `val.txt` are tokenised and saved as `train.bin` / `val.bin` (memmap). Subsequent runs skip tokenisation.
 
-### Monitoring Training
+Training prints per-epoch:
+```
+Epoch 1/50, Train Loss: 7.9899, Val Loss: 6.2418, Mem: 1.23GB (peak 1.45GB), GPU util: 87%
+```
 
-View training metrics with TensorBoard:
+After training, `training_stats.png` is saved with three plots: loss curves, GPU memory (allocated + peak), and GPU utilisation.
+
+### Configuration (`config.py`)
+
+```python
+# Dataset
+context_length  = 128     # token sequence length
+batch_size      = 8       # training batch size
+steps_per_epoch = 1000    # training steps per epoch
+val_steps       = 200     # validation steps per epoch
+
+# Model
+use_compile     = True    # set False when profiling with ncu
+num_embeddings  = 128     # embedding / hidden dimension
+num_heads       = 4       # attention heads
+num_blocks      = 4       # transformer blocks
+learning_rate   = 3e-4
+num_epochs      = 50
+```
+
+### Training details
+
+- **Optimiser**: AdamW (`weight_decay=1e-5`)
+- **LR schedule**: CosineAnnealingLR (`eta_min=1e-7`)
+- **Precision**: BF16 autocast (forward + validation) — no GradScaler needed
+- **Gradient clipping**: `max_norm=1.0`
+- **Compilation**: `torch.compile()` (toggle via `config.use_compile`)
+- **Data loading**: `np.memmap` + random sampling via `get_batch()`
+- **Checkpointing**: `best_model.pt` saved on validation loss improvement
+
+---
+
+## Monitoring
+
 ```bash
 tensorboard --logdir=runs
 ```
 
-### Text Generation
+Logs: train/val loss, gradient norms, weight norms, GPU memory (allocated + peak), GPU utilisation.
 
-After training, the model automatically generates text starting with "Once". To generate custom text, modify the start tokens in main.py:95:
+---
 
-```python
-start_tokens = torch.tensor(tokenizer.encode("Your prompt here"), dtype=torch.long).unsqueeze(0).to(device)
-generated_content = model.generate(start_tokens, max_new_tokens=1500)[0].tolist()
-print(tokenizer.decode(generated_content))
+## CUDA Kernel Benchmarking
+
+```bash
+python test_layernorm.py
 ```
 
-## Configuration
+Runs correctness checks (max error vs PyTorch) and latency benchmarks for all three kernel versions at N=128 and N=768.
 
-Edit `config.py` to customize training:
+---
 
-```python
-# Dataset
-context_length = 128  # Maximum sequence length
-stride = 32          # Sliding window stride
-batch_size = 8       # Training batch size
+## Profiling with Nsight Compute
 
-# Model
-num_embeddings = 128  # Embedding dimension
-learning_rate = 3e-4  # Learning rate
-num_epochs = 50       # Training epochs
+```bash
+# One-time setup
+sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
+sudo apt install ninja-build
+
+# Profile only the fused LayerNorm kernel
+sudo -E $(which ncu) --set full --kernel-name fused_layernorm_kernel \
+    -o my_profile $(which python) profile_run.py
+
+# Open in GUI
+ncu-ui my_profile.ncu-rep
 ```
 
-## Training Details
+`profile_run.py` has `torch.compile` disabled and calls the kernel directly (bypassing the model) to ensure the custom kernel is captured rather than falling back to PyTorch's implementation. NVTX range markers (`"fused_layernorm_forward"`) label the profiled region in the timeline view.
 
-- **Optimizer**: AdamW with weight decay (1e-5)
-- **Learning Rate Schedule**: Cosine annealing (min: 1e-7)
-- **Loss Function**: Custom cross-entropy implementation
-- **Precision**: High precision float32 matmul
-- **Compilation**: Uses torch.compile for performance
+---
 
-## Model Output
+## Requirements
 
-The trained model checkpoint (`best_model.pt`) contains:
-- Model state dictionary
-- Optimizer state
-- Training epoch number
-- Loss value
+- Python 3.8+
+- PyTorch 2.0+ with CUDA
+- `ninja-build` (for JIT CUDA kernel compilation)
+- See `requirements.txt` for full Python dependencies
+
+---
 
 ## License
 
@@ -144,10 +180,6 @@ MIT License
 
 ## Acknowledgments
 
-- Built using the TinyStories dataset
-- Inspired by GPT-2 architecture
-- Uses OpenAI's tiktoken tokenizer
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories) by Eldan & Li
+- GPT-2 architecture by OpenAI
+- tiktoken tokeniser by OpenAI
