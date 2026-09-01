@@ -149,14 +149,30 @@ def gather_state(base_model, model, optimizer, cfg, dinfo):
     must reach them, even though only rank 0 ends up holding the full tensors.
     """
     if dinfo.enabled and cfg.strategy == "fsdp":
-        from torch.distributed.fsdp import FullStateDictConfig
+        from torch.distributed.fsdp import (FullOptimStateDictConfig,
+                                            FullStateDictConfig, StateDictType)
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType
 
+        # Both the model and the optimizer state need their own config, and
+        # optim_state_dict must run *inside* the same state_dict_type context.
+        # Called outside it, it falls back to the default sharded handling and
+        # does not match the full model state dict gathered above.
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        optim_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT,
+                                  save_policy, optim_policy):
             model_state = model.state_dict()
-        optim_state = FSDP.optim_state_dict(model, optimizer)
+            try:
+                optim_state = FSDP.optim_state_dict(model, optimizer)
+            except Exception as exc:  # noqa: BLE001
+                # Gathering optimizer state across shards is brittle; losing it
+                # costs the Adam moments on resume, which is recoverable. Losing
+                # the trained weights because the run aborted here is not.
+                if dinfo.is_master:
+                    print(f"[checkpoint] FSDP optimizer state could not be "
+                          f"gathered ({exc.__class__.__name__}: {exc}); saving "
+                          f"model weights only.", flush=True)
+                optim_state = {}
         return model_state, optim_state
 
     return base_model.state_dict(), optimizer.state_dict()
@@ -247,20 +263,22 @@ def main():
     log(f"[model] parameters: {base_model.num_parameters():,}", dinfo)
     log(f"[model] LayerNorm path: {fused_ln.kernel_status()}", dinfo)
 
-    optimizer, n_decay, n_nodecay = base_model.configure_optimizers(
-        cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2), dinfo.device_type
-    )
-    log(f"[optim] decayed tensors: {n_decay} | undecayed: {n_nodecay}", dinfo)
-
+    # Model weights are restored *before* wrapping, while the module is still a
+    # plain GPT2 and a full state dict loads cleanly. Optimizer state is
+    # restored after the optimizer exists (below).
     start_epoch, global_step, best_val_loss = 0, 0, float("inf")
     resume_path = cfg.resume
     if resume_path == "auto":
         candidate = os.path.join(cfg.out_dir, "last.pt")
         resume_path = candidate if os.path.exists(candidate) else ""
+    resume_ckpt = None
     if resume_path:
-        start_epoch, global_step, best_val_loss = load_checkpoint(
-            resume_path, base_model, optimizer, dinfo.device
-        )
+        resume_ckpt = torch.load(resume_path, map_location=dinfo.device,
+                                 weights_only=False)
+        base_model.load_state_dict(resume_ckpt["model_state_dict"])
+        start_epoch = resume_ckpt.get("epoch", 0)
+        global_step = resume_ckpt.get("step", 0)
+        best_val_loss = resume_ckpt.get("best_val_loss", float("inf"))
         log(f"[resume] {resume_path} @ epoch {start_epoch}, step {global_step}", dinfo)
 
     # Wrap for distribution first, then compile the wrapper. FSDP in particular
@@ -277,11 +295,41 @@ def main():
             policy = functools.partial(
                 transformer_auto_wrap_policy, transformer_layer_cls={Block}
             )
-            model = FSDP(model, auto_wrap_policy=policy, device_id=dinfo.local_rank)
+            # use_orig_params keeps the original parameter shapes and names
+            # visible. Without it FSDP exposes flattened 1-D FlatParameters, so
+            # the "decay only tensors with dim >= 2" rule below would put every
+            # parameter in the no-decay group.
+            model = FSDP(model, auto_wrap_policy=policy,
+                         device_id=dinfo.local_rank, use_orig_params=True)
         else:
             # device_ids is only valid for single-CUDA-device processes.
             device_ids = [dinfo.local_rank] if dinfo.device_type == "cuda" else None
             model = DDP(model, device_ids=device_ids)
+
+    # The optimizer must be built from the *wrapped* module. FSDP replaces the
+    # parameters with sharded ones, so an optimizer constructed over the
+    # original tensors would update parameters the model no longer uses — the
+    # run fails outright. DDP leaves parameters alone, so it is unaffected
+    # either way; building after the wrap is correct for both.
+    optimizer, n_decay, n_nodecay = base_model.configure_optimizers(
+        cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2),
+        dinfo.device_type, module=model,
+        allow_fused=not (dinfo.enabled and cfg.strategy == "fsdp"),
+    )
+    log(f"[optim] decayed tensors: {n_decay} | undecayed: {n_nodecay}", dinfo)
+
+    if resume_ckpt is not None and "optimizer_state_dict" in resume_ckpt:
+        if dinfo.enabled and cfg.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            optimizer.load_state_dict(
+                FSDP.optim_state_dict_to_load(
+                    model, optimizer, resume_ckpt["optimizer_state_dict"]
+                )
+            )
+        else:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+    resume_ckpt = None  # release the checkpoint's tensors
 
     if cfg.use_compile:
         log("[model] compiling (first step will be slow) ...", dinfo)
@@ -310,7 +358,21 @@ def main():
     amp_ctx = (torch.autocast(device_type="cuda", dtype=ptdtype)
                if use_amp else nullcontext())
     # bf16 shares fp32's exponent range, so it needs no loss scaling; fp16 does.
-    scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16 and use_amp))
+    scaler_enabled = ptdtype == torch.float16 and use_amp
+    if scaler_enabled and dinfo.enabled and cfg.strategy == "fsdp":
+        # A plain GradScaler decides whether to skip a step from a *local*
+        # inf/nan check. Under DDP that is safe because gradients are
+        # all-reduced and every rank sees the same values. Under FSDP the
+        # gradients are sharded, so ranks inspect different numbers and skip
+        # different steps — their optimizer step counters then diverge, and
+        # FSDP.optim_state_dict aborts with "Rank N has different values for
+        # step". ShardedGradScaler all-reduces the found_inf flag so every rank
+        # skips together.
+        from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
+        scaler = ShardedGradScaler(enabled=True)
+    else:
+        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
 
     total_steps = cfg.num_epochs * cfg.steps_per_epoch
     tokens_per_step = (cfg.batch_size * cfg.grad_accum_steps
@@ -453,10 +515,18 @@ def main():
         history["util"].append(mean_util)
         stats["gpu/utilization_mean_pct"] = mean_util
 
+        # Throughput over the whole epoch, reported unconditionally. The
+        # per-interval tok/s line only prints every log_interval*20 steps, so a
+        # short run could finish without ever showing a throughput figure.
+        epoch_secs = time.time() - t_epoch
+        epoch_tok_per_sec = tokens_per_step * cfg.steps_per_epoch / max(epoch_secs, 1e-9)
+        stats["perf/epoch_tokens_per_sec"] = epoch_tok_per_sec
+
         log(f"Epoch {epoch+1}/{cfg.num_epochs} | train {avg_train:.4f} | "
             f"val {avg_val:.4f} | ppl {math.exp(min(avg_val, 20)):.1f} | "
             f"peak {stats.get('gpu/mem_peak_gb', 0):.2f}GB | "
-            f"{time.time()-t_epoch:.0f}s", dinfo)
+            f"{epoch_tok_per_sec/1e3:.1f}k tok/s | "
+            f"{epoch_secs:.0f}s", dinfo)
 
         if wandb_run is not None:
             wandb_run.log({"train/epoch_loss": avg_train,
@@ -494,7 +564,8 @@ def main():
 
     # ── Post-training artefacts (rank 0) ────────────────────────────────────
     if dinfo.is_master:
-        _plot_history(history, wandb_run)
+        _plot_history(history, wandb_run,
+                      os.path.join(cfg.out_dir, "training_stats.png"))
 
         if cfg.generate_after_training:
             log("\n--- sample ---", dinfo)
@@ -519,7 +590,7 @@ def main():
     dinfo.cleanup()
 
 
-def _plot_history(history, wandb_run):
+def _plot_history(history, wandb_run, out_path="training_stats.png"):
     if not history["train"]:
         return
     import matplotlib
@@ -552,9 +623,13 @@ def _plot_history(history, wandb_run):
     axes[2].legend()
 
     plt.tight_layout()
-    plt.savefig("training_stats.png", dpi=150, bbox_inches="tight")
+    # Written into out_dir rather than the working directory: the copy at
+    # the repo root is a curated artifact referenced by the README, and a
+    # stray training run should not overwrite it.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[plot] wrote training_stats.png")
+    print(f"[plot] wrote {out_path}")
 
 
 if __name__ == "__main__":

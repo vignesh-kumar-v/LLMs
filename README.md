@@ -65,6 +65,25 @@ Prompted with `"Once upon a time"`, temperature 0.8, top-k 200:
 
 Generations end stories cleanly at `<|endoftext|>` — the model learned document boundaries because `TinyStories.py` writes an explicit separator between stories.
 
+### DDP scaling
+
+Measured on the same 2× T4, identical workload, per-device batch held constant (weak scaling — the correct measurement for data parallelism, since the point is to process more tokens per unit time):
+
+| GPUs | Throughput | Speedup | Efficiency |
+|---|---|---|---|
+| 1 | 35,300 tok/s | 1.00× | — |
+| 2 | 64,500 tok/s | **1.83×** | **91%** |
+
+91% at 2 GPUs is healthy. The missing 9% is gradient all-reduce, which is a fixed cost per step that does not shrink as you add devices — T4s are PCIe-connected with no NVLink, so this is roughly the ceiling for this interconnect.
+
+FSDP (`--strategy=fsdp`) reaches 54,000 tok/s on the same hardware — slower than DDP, as expected: it shards parameters and optimizer state and pays extra communication to gather them, which only becomes worthwhile once the model no longer fits on one device. At 30M parameters it does not.
+
+Reproduce with `./kaggle_run/push.sh --benchmark`.
+
+### Profiling
+
+Nsight Compute cannot run on Kaggle: collecting GPU performance counters requires elevated permissions (`ERR_NVGPUCTRPERM`) that an unprivileged notebook kernel cannot obtain. `profile_run.py` itself is verified working — it runs correctly under `ncu`, only the counter collection is refused. Profiling needs a machine where you can set `perf_event_paranoid` or run as root.
+
 ### Experiment tracking
 
 3,200 logged steps across 166 metrics, including per-tensor gradient and parameter histograms for every block, throughput, and GPU telemetry. Logged offline on Kaggle and synced afterwards with `wandb sync`.

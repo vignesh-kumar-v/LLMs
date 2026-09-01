@@ -3,6 +3,7 @@
 # kernel on 2x T4.
 #
 #   ./kaggle_run/push.sh              # upload source, push kernel, start run
+#   ./kaggle_run/push.sh --benchmark  # DDP scaling, FSDP, ncu profiling
 #   ./kaggle_run/push.sh --status     # check the current run
 #   ./kaggle_run/push.sh --logs       # print kernel logs
 #   ./kaggle_run/push.sh --fetch      # download output into ./artifacts
@@ -25,11 +26,14 @@ DATASET_SLUG="${DATASET_SLUG:-nanollm-src}"
 # PyTorch build does not even support the P100's sm_60. So this matters.
 ACCELERATOR="${ACCELERATOR:-NvidiaTeslaT4}"
 require_auth() {
-  if ! ${KAGGLE} config view >/dev/null 2>&1; then
+  # `kaggle config view` reads a cached file and succeeds even when the OAuth
+  # token has since expired, so it is not a usable liveness check. Call a real
+  # authenticated endpoint instead.
+  if ! ${KAGGLE} quota 2>&1 | grep -qE "GPU|TPU"; then
     cat <<'EOF'
-Kaggle CLI is not authenticated.
+Kaggle CLI is not authenticated, or the session has expired.
 
-  Run ONE of these, then re-run this script:
+  OAuth tokens expire periodically. Run ONE of these, then re-run this script:
     kaggle auth login
     export KAGGLE_API_TOKEN=<token from https://www.kaggle.com/settings/api>
 
@@ -43,8 +47,9 @@ kaggle_username() {
 }
 
 case "${1:-}" in
-  --validate) MODE=validate ;;
-  --train)    MODE=train ;;
+  --validate)  MODE=validate ;;
+  --train)     MODE=train ;;
+  --benchmark) MODE=benchmark ;;
 esac
 
 # Validation and training are separate kernels so a long training run is never
@@ -53,6 +58,11 @@ if [ "${MODE}" = "validate" ]; then
   KERNEL_SLUG="${KERNEL_SLUG:-nanollm-validate-t4x2}"
   KERNEL_SCRIPT="validate_kaggle.py"
   KERNEL_TITLE="NanoLLM validate t4x2"
+  TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-3600}"
+elif [ "${MODE}" = "benchmark" ]; then
+  KERNEL_SLUG="${KERNEL_SLUG:-nanollm-benchmark-t4x2}"
+  KERNEL_SCRIPT="benchmark_kaggle.py"
+  KERNEL_TITLE="NanoLLM benchmark t4x2"
   TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-3600}"
 else
   KERNEL_SLUG="${KERNEL_SLUG:-nanollm-ddp-t4x2}"
