@@ -247,20 +247,22 @@ def main():
     log(f"[model] parameters: {base_model.num_parameters():,}", dinfo)
     log(f"[model] LayerNorm path: {fused_ln.kernel_status()}", dinfo)
 
-    optimizer, n_decay, n_nodecay = base_model.configure_optimizers(
-        cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2), dinfo.device_type
-    )
-    log(f"[optim] decayed tensors: {n_decay} | undecayed: {n_nodecay}", dinfo)
-
+    # Model weights are restored *before* wrapping, while the module is still a
+    # plain GPT2 and a full state dict loads cleanly. Optimizer state is
+    # restored after the optimizer exists (below).
     start_epoch, global_step, best_val_loss = 0, 0, float("inf")
     resume_path = cfg.resume
     if resume_path == "auto":
         candidate = os.path.join(cfg.out_dir, "last.pt")
         resume_path = candidate if os.path.exists(candidate) else ""
+    resume_ckpt = None
     if resume_path:
-        start_epoch, global_step, best_val_loss = load_checkpoint(
-            resume_path, base_model, optimizer, dinfo.device
-        )
+        resume_ckpt = torch.load(resume_path, map_location=dinfo.device,
+                                 weights_only=False)
+        base_model.load_state_dict(resume_ckpt["model_state_dict"])
+        start_epoch = resume_ckpt.get("epoch", 0)
+        global_step = resume_ckpt.get("step", 0)
+        best_val_loss = resume_ckpt.get("best_val_loss", float("inf"))
         log(f"[resume] {resume_path} @ epoch {start_epoch}, step {global_step}", dinfo)
 
     # Wrap for distribution first, then compile the wrapper. FSDP in particular
@@ -277,11 +279,40 @@ def main():
             policy = functools.partial(
                 transformer_auto_wrap_policy, transformer_layer_cls={Block}
             )
-            model = FSDP(model, auto_wrap_policy=policy, device_id=dinfo.local_rank)
+            # use_orig_params keeps the original parameter shapes and names
+            # visible. Without it FSDP exposes flattened 1-D FlatParameters, so
+            # the "decay only tensors with dim >= 2" rule below would put every
+            # parameter in the no-decay group.
+            model = FSDP(model, auto_wrap_policy=policy,
+                         device_id=dinfo.local_rank, use_orig_params=True)
         else:
             # device_ids is only valid for single-CUDA-device processes.
             device_ids = [dinfo.local_rank] if dinfo.device_type == "cuda" else None
             model = DDP(model, device_ids=device_ids)
+
+    # The optimizer must be built from the *wrapped* module. FSDP replaces the
+    # parameters with sharded ones, so an optimizer constructed over the
+    # original tensors would update parameters the model no longer uses — the
+    # run fails outright. DDP leaves parameters alone, so it is unaffected
+    # either way; building after the wrap is correct for both.
+    optimizer, n_decay, n_nodecay = base_model.configure_optimizers(
+        cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2),
+        dinfo.device_type, module=model,
+    )
+    log(f"[optim] decayed tensors: {n_decay} | undecayed: {n_nodecay}", dinfo)
+
+    if resume_ckpt is not None and "optimizer_state_dict" in resume_ckpt:
+        if dinfo.enabled and cfg.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            optimizer.load_state_dict(
+                FSDP.optim_state_dict_to_load(
+                    model, optimizer, resume_ckpt["optimizer_state_dict"]
+                )
+            )
+        else:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+    resume_ckpt = None  # release the checkpoint's tensors
 
     if cfg.use_compile:
         log("[model] compiling (first step will be slow) ...", dinfo)
@@ -453,10 +484,18 @@ def main():
         history["util"].append(mean_util)
         stats["gpu/utilization_mean_pct"] = mean_util
 
+        # Throughput over the whole epoch, reported unconditionally. The
+        # per-interval tok/s line only prints every log_interval*20 steps, so a
+        # short run could finish without ever showing a throughput figure.
+        epoch_secs = time.time() - t_epoch
+        epoch_tok_per_sec = tokens_per_step * cfg.steps_per_epoch / max(epoch_secs, 1e-9)
+        stats["perf/epoch_tokens_per_sec"] = epoch_tok_per_sec
+
         log(f"Epoch {epoch+1}/{cfg.num_epochs} | train {avg_train:.4f} | "
             f"val {avg_val:.4f} | ppl {math.exp(min(avg_val, 20)):.1f} | "
             f"peak {stats.get('gpu/mem_peak_gb', 0):.2f}GB | "
-            f"{time.time()-t_epoch:.0f}s", dinfo)
+            f"{epoch_tok_per_sec/1e3:.1f}k tok/s | "
+            f"{epoch_secs:.0f}s", dinfo)
 
         if wandb_run is not None:
             wandb_run.log({"train/epoch_loss": avg_train,

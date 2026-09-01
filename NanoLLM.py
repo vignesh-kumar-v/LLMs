@@ -203,15 +203,21 @@ class GPT2(nn.Module):
         logits = self.lm_head(x)
         return (logits, presents) if use_cache else logits
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             module=None):
         """AdamW with the standard GPT-2 parameter grouping.
 
         Weight decay is applied only to matmul/embedding weights; biases and
         LayerNorm gains are left undecayed. Applying decay to 1D params is a
         well-known way to quietly hurt small-model quality.
+
+        `module` overrides where the parameters come from. Under FSDP the
+        optimizer must be built over the *wrapped* module's parameters, since
+        FSDP replaces them with sharded ones; pass the wrapper here.
         """
+        source = module if module is not None else self
         decay, no_decay = [], []
-        for name, param in self.named_parameters():
+        for name, param in source.named_parameters():
             if not param.requires_grad:
                 continue
             (decay if param.dim() >= 2 else no_decay).append(param)
