@@ -2,6 +2,7 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 
 __device__ __forceinline__ void welford_merge(
     float& mean_a, float& M2_a, int& cnt_a,
@@ -133,6 +134,17 @@ torch::Tensor fused_layernorm_v3_cuda(
 {
     int B = x.size(0);
     int N = x.size(1);
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::Float,
+                "V3 kernel requires a float32 CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "V3 kernel requires a contiguous tensor");
+    // The float4 path reinterprets the row pointer as a 16-byte type. PyTorch's
+    // allocator returns aligned storage, but a view with a non-zero offset does
+    // not have to be — so assert instead of assuming.
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr<float>()) % 16 == 0,
+                "V3 kernel requires 16-byte aligned input");
+    TORCH_CHECK(N % 4 == 0,
+                "V3 kernel requires N divisible by 4 for aligned row starts, got N=", N);
+
     auto out = torch::empty_like(x);
 
     const int ROWS_PER_BLOCK = 4;

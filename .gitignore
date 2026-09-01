@@ -39,6 +39,17 @@ logs/
 
 # Claude Code
 .claude/
+PROJECT_UNDERSTANDING.md
+further_additions.md
+
+# Training outputs
+checkpoints/
+artifacts/
+train.log
+*.meta.json
+
+# Weights & Biases
+wandb/
 
 # OS
 .DS_Store
@@ -75,6 +86,8 @@ ENV/
 *.png
 *.jpg
 *.jpeg
+# ...except the published training curves referenced from the README
+!training_stats.png
 
 # Logs
 *.log

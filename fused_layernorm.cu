@@ -49,6 +49,13 @@ torch::Tensor fused_layernorm_naive_cuda(
     torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, float eps = 1e-5)
 {
     int B = x.size(0), N = x.size(1);
+    // V1/V2 assign exactly one element per thread, and a block caps out at
+    // 1024 threads. Above that the tail of every row would be silently
+    // dropped, so refuse rather than return wrong numbers. (The production
+    // kernel in fused_layernorm_train.cu has no such limit.)
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::Float,
+                "V1 kernel requires a float32 CUDA tensor");
+    TORCH_CHECK(N <= 1024, "V1 kernel supports N <= 1024, got N=", N);
     auto out = torch::empty_like(x);
     int threads = 1;
     while (threads < N) threads <<= 1;
@@ -153,6 +160,9 @@ torch::Tensor fused_layernorm_cuda(
     torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, float eps = 1e-5)
 {
     int B = x.size(0), N = x.size(1);
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::Float,
+                "V2 kernel requires a float32 CUDA tensor");
+    TORCH_CHECK(N <= 1024, "V2 kernel supports N <= 1024, got N=", N);
     auto out = torch::empty_like(x);
     int threads = 1;
     while (threads < N) threads <<= 1;
