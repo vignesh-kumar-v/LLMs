@@ -564,7 +564,8 @@ def main():
 
     # ── Post-training artefacts (rank 0) ────────────────────────────────────
     if dinfo.is_master:
-        _plot_history(history, wandb_run)
+        _plot_history(history, wandb_run,
+                      os.path.join(cfg.out_dir, "training_stats.png"))
 
         if cfg.generate_after_training:
             log("\n--- sample ---", dinfo)
@@ -589,7 +590,7 @@ def main():
     dinfo.cleanup()
 
 
-def _plot_history(history, wandb_run):
+def _plot_history(history, wandb_run, out_path="training_stats.png"):
     if not history["train"]:
         return
     import matplotlib
@@ -622,9 +623,13 @@ def _plot_history(history, wandb_run):
     axes[2].legend()
 
     plt.tight_layout()
-    plt.savefig("training_stats.png", dpi=150, bbox_inches="tight")
+    # Written into out_dir rather than the working directory: the copy at
+    # the repo root is a curated artifact referenced by the README, and a
+    # stray training run should not overwrite it.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[plot] wrote training_stats.png")
+    print(f"[plot] wrote {out_path}")
 
 
 if __name__ == "__main__":

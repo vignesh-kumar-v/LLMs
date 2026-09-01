@@ -149,10 +149,12 @@ def main():
     run(cmd, cwd=STAGE_DIR, env=env)
 
     # ── Collect artefacts into the kernel output ────────────────────────────
-    for name in ("training_stats.png",):
-        srcp = os.path.join(STAGE_DIR, name)
-        if os.path.exists(srcp):
-            shutil.copy(srcp, os.path.join(WORK_DIR, name))
+    # main.py writes the plot into out_dir, which already lives under
+    # /kaggle/working, so nothing needs copying; kept as a fallback for older
+    # runs that wrote it beside the source.
+    legacy = os.path.join(STAGE_DIR, "training_stats.png")
+    if os.path.exists(legacy):
+        shutil.copy(legacy, os.path.join(WORK_DIR, "training_stats.png"))
 
     print(f"\nDone in {(time.time()-t0)/60:.1f} min")
     print("Output files:")
