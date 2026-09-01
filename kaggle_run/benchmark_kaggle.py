@@ -29,6 +29,8 @@ TEMP_DIR = "/kaggle/temp"
 STAGE_DIR = os.path.join(TEMP_DIR, "nanollm")
 
 STEPS = int(os.environ.get("BENCH_STEPS", "150"))
+#: "scaling" | "fsdp" | "ncu"; empty runs everything.
+ONLY = os.environ.get("BENCH_ONLY", "fsdp").strip().lower()
 MODEL_ARGS = [
     "--context_length=256", "--batch_size=24",
     "--num_embeddings=384", "--num_heads=6", "--num_blocks=6",
@@ -45,10 +47,13 @@ def run(cmd, capture=False, **kw):
     if capture:
         r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
                            text=True, **kw)
-        print(r.stdout[-4000:])
+        print(r.stdout[-6000:])
         if r.stderr:
             print("--- stderr tail ---")
-            print(r.stderr[-2000:])
+            # Generous: torchrun appends its own wrapper traceback after the
+            # child's, so a small tail shows only the wrapper and hides the
+            # actual cause.
+            print(r.stderr[-14000:])
         return r.returncode, r.stdout + r.stderr
     r = subprocess.run(cmd, shell=isinstance(cmd, str), **kw)
     return r.returncode, ""
@@ -124,7 +129,9 @@ def main():
     print(f"STEP 1 — DDP scaling ({STEPS} steps per configuration)")
     print("=" * 70)
     throughput = {}
-    for ngpu in (1, 2):
+    if ONLY and ONLY != "scaling":
+        print("skipped (BENCH_ONLY)")
+    for ngpu in (() if (ONLY and ONLY != "scaling") else (1, 2)):
         if ngpu > n_gpu:
             print(f"\n--- {ngpu} GPU: skipped (only {n_gpu} available) ---")
             continue
@@ -149,7 +156,9 @@ def main():
     print("\n" + "=" * 70)
     print("STEP 2 — FSDP on 2 GPUs")
     print("=" * 70)
-    if n_gpu >= 2:
+    if ONLY and ONLY != "fsdp":
+        print("skipped (BENCH_ONLY)")
+    elif n_gpu >= 2:
         code, out = run([
             "torchrun", "--standalone", "--nproc_per_node=2", "main.py",
             f"--data_dir={data_dir}",
@@ -167,10 +176,42 @@ def main():
     print("\n" + "=" * 70)
     print("STEP 3 — Nsight Compute profiling")
     print("=" * 70)
-    ncu = shutil.which("ncu") or shutil.which("/usr/local/cuda/bin/ncu")
-    for cand in ("/usr/local/cuda/bin/ncu", "/opt/nvidia/nsight-compute/ncu"):
-        if not ncu and os.path.exists(cand):
-            ncu = cand
+    ncu = None
+    if ONLY and ONLY != "ncu":
+        print("skipped (BENCH_ONLY)")
+        results["ncu"] = "skipped"
+    else:
+        ncu = shutil.which("ncu")
+        for cand in ("/usr/local/cuda/bin/ncu", "/opt/nvidia/nsight-compute/ncu"):
+            if not ncu and os.path.exists(cand):
+                ncu = cand
+        _run_ncu(ncu, results, base_env)
+
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    for k, v in results.items():
+        if v == 0:
+            status = "PASS"
+        elif isinstance(v, str):
+            status = v.upper()
+        else:
+            status = f"FAIL (exit {v})"
+        print(f"  {k:16s} {status}")
+
+    if throughput.get(1) and throughput.get(2):
+        t1, t2 = throughput[1], throughput[2]
+        print(f"\n  DDP weak scaling (per-device batch held constant):")
+        print(f"    1 GPU : {t1:>10,.0f} tok/s")
+        print(f"    2 GPU : {t2:>10,.0f} tok/s")
+        print(f"    speedup    {t2/t1:.2f}x   efficiency {t2/t1/2*100:.0f}%")
+    if throughput.get("fsdp"):
+        print(f"    FSDP 2 GPU: {throughput['fsdp']:,.0f} tok/s")
+
+
+def _run_ncu(ncu, results, base_env):
     if not ncu:
         print("ncu not found on this image — profiling cannot run here.")
         print("Searched PATH, /usr/local/cuda/bin, /opt/nvidia/nsight-compute.")
@@ -196,29 +237,6 @@ def main():
                   "counter collection was refused. Profiling needs a machine "
                   "where you can set perf_event_paranoid or run as root.")
             results["ncu"] = "blocked-by-environment"
-
-    # ── Summary ─────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    for k, v in results.items():
-        if v == 0:
-            status = "PASS"
-        elif isinstance(v, str):
-            status = v.upper()
-        else:
-            status = f"FAIL (exit {v})"
-        print(f"  {k:16s} {status}")
-
-    if throughput.get(1) and throughput.get(2):
-        t1, t2 = throughput[1], throughput[2]
-        print(f"\n  DDP weak scaling (per-device batch held constant):")
-        print(f"    1 GPU : {t1:>10,.0f} tok/s")
-        print(f"    2 GPU : {t2:>10,.0f} tok/s")
-        print(f"    speedup    {t2/t1:.2f}x   efficiency {t2/t1/2*100:.0f}%")
-    if throughput.get("fsdp"):
-        print(f"    FSDP 2 GPU: {throughput['fsdp']:,.0f} tok/s")
-
 
 if __name__ == "__main__":
     main()

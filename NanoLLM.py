@@ -204,7 +204,7 @@ class GPT2(nn.Module):
         return (logits, presents) if use_cache else logits
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
-                             module=None):
+                             module=None, allow_fused=True):
         """AdamW with the standard GPT-2 parameter grouping.
 
         Weight decay is applied only to matmul/embedding weights; biases and
@@ -214,6 +214,7 @@ class GPT2(nn.Module):
         `module` overrides where the parameters come from. Under FSDP the
         optimizer must be built over the *wrapped* module's parameters, since
         FSDP replaces them with sharded ones; pass the wrapper here.
+        `allow_fused` must be False under FSDP - see the note below.
         """
         source = module if module is not None else self
         decay, no_decay = [], []
@@ -227,9 +228,15 @@ class GPT2(nn.Module):
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-        # Fused AdamW is a large win on CUDA and is available in torch >= 2.0.
+        # Fused AdamW is a large win on CUDA. It is left off under FSDP as a
+        # precaution: fused optimizers and FSDP's flat-parameter handling have
+        # known rough edges, and the throughput cost at this model size is
+        # small. (Note: this is *not* what caused the rank step-count mismatch
+        # in FSDP checkpointing — that was the unsharded GradScaler, fixed in
+        # main.py.)
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        extra = {"fused": True} if (fused_available and device_type == "cuda") else {}
+        use_fused = fused_available and device_type == "cuda" and allow_fused
+        extra = {"fused": True} if use_fused else {}
         optimizer = torch.optim.AdamW(groups, lr=learning_rate, betas=betas, **extra)
         return optimizer, len(decay), len(no_decay)
 

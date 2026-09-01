@@ -149,14 +149,30 @@ def gather_state(base_model, model, optimizer, cfg, dinfo):
     must reach them, even though only rank 0 ends up holding the full tensors.
     """
     if dinfo.enabled and cfg.strategy == "fsdp":
-        from torch.distributed.fsdp import FullStateDictConfig
+        from torch.distributed.fsdp import (FullOptimStateDictConfig,
+                                            FullStateDictConfig, StateDictType)
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType
 
+        # Both the model and the optimizer state need their own config, and
+        # optim_state_dict must run *inside* the same state_dict_type context.
+        # Called outside it, it falls back to the default sharded handling and
+        # does not match the full model state dict gathered above.
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        optim_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT,
+                                  save_policy, optim_policy):
             model_state = model.state_dict()
-        optim_state = FSDP.optim_state_dict(model, optimizer)
+            try:
+                optim_state = FSDP.optim_state_dict(model, optimizer)
+            except Exception as exc:  # noqa: BLE001
+                # Gathering optimizer state across shards is brittle; losing it
+                # costs the Adam moments on resume, which is recoverable. Losing
+                # the trained weights because the run aborted here is not.
+                if dinfo.is_master:
+                    print(f"[checkpoint] FSDP optimizer state could not be "
+                          f"gathered ({exc.__class__.__name__}: {exc}); saving "
+                          f"model weights only.", flush=True)
+                optim_state = {}
         return model_state, optim_state
 
     return base_model.state_dict(), optimizer.state_dict()
@@ -298,6 +314,7 @@ def main():
     optimizer, n_decay, n_nodecay = base_model.configure_optimizers(
         cfg.weight_decay, cfg.learning_rate, (cfg.beta1, cfg.beta2),
         dinfo.device_type, module=model,
+        allow_fused=not (dinfo.enabled and cfg.strategy == "fsdp"),
     )
     log(f"[optim] decayed tensors: {n_decay} | undecayed: {n_nodecay}", dinfo)
 
@@ -341,7 +358,21 @@ def main():
     amp_ctx = (torch.autocast(device_type="cuda", dtype=ptdtype)
                if use_amp else nullcontext())
     # bf16 shares fp32's exponent range, so it needs no loss scaling; fp16 does.
-    scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16 and use_amp))
+    scaler_enabled = ptdtype == torch.float16 and use_amp
+    if scaler_enabled and dinfo.enabled and cfg.strategy == "fsdp":
+        # A plain GradScaler decides whether to skip a step from a *local*
+        # inf/nan check. Under DDP that is safe because gradients are
+        # all-reduced and every rank sees the same values. Under FSDP the
+        # gradients are sharded, so ranks inspect different numbers and skip
+        # different steps — their optimizer step counters then diverge, and
+        # FSDP.optim_state_dict aborts with "Rank N has different values for
+        # step". ShardedGradScaler all-reduces the found_inf flag so every rank
+        # skips together.
+        from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
+        scaler = ShardedGradScaler(enabled=True)
+    else:
+        scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
 
     total_steps = cfg.num_epochs * cfg.steps_per_epoch
     tokens_per_step = (cfg.batch_size * cfg.grad_accum_steps
